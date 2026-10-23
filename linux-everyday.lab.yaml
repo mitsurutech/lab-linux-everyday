@@ -1,0 +1,146 @@
+# Everyday Linux commands
+# One Ubuntu VM with something real for every command a software engineer uses every day:
+# a growing log, an archive, a web server, two processes, and a second account to ssh to.
+cpus: 1
+memory: 1024    # MB
+disk: 10        # GB
+
+# Nothing opens in the browser: the lab is the terminal.
+open: []
+
+# Run once, as root. Its output is kept in /var/log/mitsurutech-setup.log on the VM.
+setup: |
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq zip unzip wget curl openssh-server vim python3
+  home=/home/student
+  [ -d $home ] || home=/root
+  as_student() { runuser -u student -- "$@"; }
+
+  # The only way out of this VM is a web proxy, so wget and curl would ask it for localhost too.
+  cat > /etc/profile.d/zz-lab-noproxy.sh <<'EVERYDAY_NOPROXY_END'
+  export no_proxy="$no_proxy,localhost,127.0.0.1"
+  export NO_PROXY="$no_proxy"
+  EVERYDAY_NOPROXY_END
+
+  # The second account, and the student's key into it.
+  id dev >/dev/null 2>&1 || useradd -m -s /bin/bash dev
+  echo 'dev:DevLab2026' | chpasswd
+  install -d -m 700 -o student -g student $home/.ssh
+  [ -f $home/.ssh/id_ed25519 ] || as_student ssh-keygen -q -t ed25519 -N '' -f $home/.ssh/id_ed25519
+  install -d -m 700 -o dev -g dev /home/dev/.ssh
+  cp $home/.ssh/id_ed25519.pub /home/dev/.ssh/authorized_keys
+  chown dev:dev /home/dev/.ssh/authorized_keys
+  chmod 600 /home/dev/.ssh/authorized_keys
+  grep -q 'Host devbox' $home/.ssh/config 2>/dev/null || cat >> $home/.ssh/config <<'EVERYDAY_SSH_END'
+  Host devbox
+    HostName 127.0.0.1
+    User dev
+    StrictHostKeyChecking accept-new
+  EVERYDAY_SSH_END
+  chown student:student $home/.ssh/config
+  chmod 600 $home/.ssh/config
+
+  # The log: an hour of lines already there, then one every two seconds.
+  touch /var/log/test.log
+  for i in $(seq 1 60); do
+    stamp=$(date -d "@$(( $(date +%s) - (61 - i) * 60 ))" '+%Y-%m-%d %H:%M:%S')
+    if [ $((i % 10)) -eq 0 ]; then
+      echo "$stamp INFO hello from the logger" >> /var/log/test.log
+    elif [ $((i % 7)) -eq 0 ]; then
+      echo "$stamp ERROR payment service did not answer" >> /var/log/test.log
+    else
+      echo "$stamp INFO request handled in $((i % 90 + 10)) ms" >> /var/log/test.log
+    fi
+  done
+  chmod 644 /var/log/test.log
+  cat > /usr/local/bin/lab-logger <<'EVERYDAY_LOGGER_END'
+  #!/bin/bash
+  # Adds a line to /var/log/test.log every two seconds: one in five is an ERROR, one in ten says hello.
+  n=0
+  while true; do
+    n=$((n + 1))
+    stamp=$(date '+%Y-%m-%d %H:%M:%S')
+    if [ $((n % 10)) -eq 0 ]; then
+      echo "$stamp INFO hello from the logger" >> /var/log/test.log
+    elif [ $((n % 5)) -eq 0 ]; then
+      echo "$stamp ERROR payment service did not answer" >> /var/log/test.log
+    else
+      echo "$stamp INFO request handled in $((RANDOM % 90 + 10)) ms" >> /var/log/test.log
+    fi
+    sleep 2
+  done
+  EVERYDAY_LOGGER_END
+
+  # Two processes to find and stop. The second ignores a plain kill.
+  cat > /usr/local/bin/lab-worker <<'EVERYDAY_WORKER_END'
+  #!/bin/bash
+  # Does nothing, slowly. A plain kill stops it.
+  while true; do sleep 5; done
+  EVERYDAY_WORKER_END
+  cat > /usr/local/bin/lab-stubborn <<'EVERYDAY_STUBBORN_END'
+  #!/bin/bash
+  # Does nothing, slowly, and ignores a plain kill. Only kill -9 stops it.
+  trap '' TERM
+  while true; do sleep 5; done
+  EVERYDAY_STUBBORN_END
+  chmod 755 /usr/local/bin/lab-logger /usr/local/bin/lab-worker /usr/local/bin/lab-stubborn
+
+  # A web server inside the lab, for wget and curl to fetch from.
+  install -d -m 755 /srv/lab-web
+  printf 'Hello from the lab web server.\n' > /srv/lab-web/hello.txt
+  printf 'day,visitors\nMonday,120\nTuesday,98\nWednesday,143\nThursday,110\nFriday,175\n' > /srv/lab-web/report.csv
+  chmod 644 /srv/lab-web/hello.txt /srv/lab-web/report.csv
+
+  unit() {
+    cat > /etc/systemd/system/$1.service <<EVERYDAY_UNIT_END
+  [Unit]
+  Description=$1 (everyday Linux lab)
+
+  [Service]
+  User=$2
+  ExecStart=$3
+  Restart=$4
+
+  [Install]
+  WantedBy=multi-user.target
+  EVERYDAY_UNIT_END
+  }
+  unit lab-logger root /usr/local/bin/lab-logger always
+  unit lab-web student '/usr/bin/python3 -m http.server 8000 --bind 127.0.0.1 --directory /srv/lab-web' always
+  unit lab-worker student /usr/local/bin/lab-worker no
+  unit lab-stubborn student /usr/local/bin/lab-stubborn no
+  systemctl daemon-reload
+  systemctl enable --now lab-logger lab-web lab-worker lab-stubborn
+
+  # What is in the student's home folder.
+  as_student mkdir -p $home/projects/app $home/projects/docs $home/scratch/cache
+  printf 'print("hello from the app")\n' > $home/projects/app/main.py
+  printf 'An app for the lab.\n' > $home/projects/app/README.txt
+  printf 'Meeting notes.\nBuy coffee.\n' > $home/projects/docs/notes.txt
+  printf 'an old log\n' > $home/scratch/old.log
+  printf 'one\n' > $home/scratch/cache/one
+  printf 'two\n' > $home/scratch/cache/two
+  for i in $(seq 1 30); do echo "line $i of a file to compress"; done > $home/test
+  ( cd /tmp && printf 'Hello from inside the zip.\n' > inside.txt && zip -q $home/test.zip inside.txt && rm inside.txt )
+  cat > $home/README.md <<'EVERYDAY_README_END'
+  # Lab: everyday Linux commands
+
+  This machine has something real for every command in the lesson Everyday Linux Commands.
+  Nothing here is marked, and nothing you do can hurt anything but this one machine.
+
+  What is here:
+
+  - /var/log/test.log is a log that grows every two seconds.
+  - test.zip and test are in your home folder, to unzip and to compress.
+  - projects is a small tree to walk about in. scratch is yours to delete from.
+  - A web server answers on localhost, port 8000.
+  - lab-worker and lab-stubborn are two processes to find and stop.
+  - devbox is a second account, dev, on this same machine. You can ssh to it with no password
+    and copy files to it with scp. To become dev with su, the password is DevLab2026.
+
+  If you break something badly, stop the lab and start it again from the lesson's bar.
+  EVERYDAY_README_END
+  chown -R student:student $home/projects $home/scratch
+  chown student:student $home/README.md $home/test $home/test.zip
+  echo "Read README.md in your home folder first." > /etc/motd
